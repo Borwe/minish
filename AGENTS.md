@@ -28,10 +28,12 @@ Priorities, in order:
 
 - Use Oxford commas in inline lists: "a, b, and c" not "a, b, c".
 - Do not use em dashes. Restructure the sentence, or use a colon or semicolon instead.
-- Avoid colorful adjectives and adverbs. Write "TCP proxy" not "lightweight TCP proxy", "scoring components" not "transparent scoring components".
-- Use noun phrases for checklist items, not imperative verbs. Write "redundant index detection" not "detect redundant indexes".
-- Headings in Markdown files must be in the title case: "Build from Source" not "Build from source". Minor words (a, an, the, and, but, or, for, in,
-  on, at, to, by, of, is, are, was, were, be) stay lowercase unless they are the first word.
+- Avoid colorful adjectives and adverbs. Write "adjacency query" not "blazing adjacency query".
+- Prefer noun phrases for checklist items over imperative verbs. Write "temp directory teardown" not "tear down the temp directory".
+- Headings in Markdown files must be in title case: "Build from Source" not "Build from source". Minor words (a, an, the, and, but, or, for, in, on,
+  at, to, by, of) stay lowercase unless they are the first word.
+- Write correct and complete sentences.
+- Avoid made-up words, abbreviations, and colons in the middle of sentences.
 
 ## Repository Layout
 
@@ -129,7 +131,7 @@ Good first tasks:
 
 Before coding:
 
-1. Identify which module(s) the change touches (`gen`, `combinators`, `runner`, `shrink`, or `core`).
+1. Identify which module (s) the change touches (`gen`, `combinators`, `runner`, `shrink`, or `core`).
 2. Consider whether a new generator also needs a shrinker.
 3. Check whether the change is public-API-visible (i.e. re-exported from `src/lib.zig`); if so, treat it as a breaking or additive API change
    deliberately.

@@ -14,6 +14,33 @@ const shrink_mod = @import("shrink.zig");
 const Allocator = std.mem.Allocator;
 const TestCase = core.TestCase;
 
+/// Statistics from one check call, including calls that return an error.
+pub const Statistics = struct {
+    /// Seed used by the runner, including an automatically derived seed.
+    seed: u64 = 0,
+    /// Generated inputs tested before shrinking, including a failing input.
+    runs: u32 = 0,
+    /// Generated inputs that passed. Passing shrink candidates are excluded.
+    passed: u32 = 0,
+    /// Shrink candidates evaluated by the property.
+    shrink_attempts: u32 = 0,
+    /// Failing shrink candidates accepted as smaller counterexamples.
+    successful_shrinks: u32 = 0,
+};
+
+/// A named input category for checkWithCoverage. Categories may overlap.
+pub fn Coverage(comptime T: type) type {
+    return struct {
+        label: []const u8,
+        /// Borrows the generated input before the property runs.
+        predicate: *const fn (T) bool,
+        /// Matching generated inputs, including a failing input but excluding shrinking.
+        hits: u32 = 0,
+        /// Percentage of tested generated inputs matching this category, or zero for no runs.
+        percentage: f64 = 0,
+    };
+}
+
 /// Configuration options for property tests.
 pub const Options = struct {
     /// Number of test runs to execute.
@@ -24,6 +51,8 @@ pub const Options = struct {
     max_shrink_attempts: u32 = 1000,
     /// Whether to print verbose output during testing.
     verbose: bool = false,
+    /// Optional output, replaced with this call's statistics when check returns.
+    statistics: ?*Statistics = null,
 };
 
 /// Run the tests with the given generator and property function.
@@ -44,12 +73,53 @@ pub fn check(
     test_fn: anytype,
     options: Options,
 ) !void {
+    return checkImpl(allocator, generator, test_fn, options, null);
+}
+
+/// Run a property and report counts and percentages for named input categories.
+/// Pass a mutable slice or array pointer of Coverage(T), where T is the generator's value type.
+/// Results replace previous counts and remain available when the check returns an error.
+/// Predicates borrow each generated input before the property runs and must not free it.
+/// Shrink candidates are excluded. Categories may overlap or leave inputs unclassified.
+pub fn checkWithCoverage(
+    allocator: Allocator,
+    generator: anytype,
+    test_fn: anytype,
+    coverage: anytype,
+    options: Options,
+) !void {
+    return checkImpl(allocator, generator, test_fn, options, coverage);
+}
+
+fn checkImpl(
+    allocator: Allocator,
+    generator: anytype,
+    test_fn: anytype,
+    options: Options,
+    coverage: anytype,
+) !void {
     // Handle seed: use provided seed or derive one from a stack address.
     // ASLR ensures the stack address differs between runs, providing non-determinism.
     const seed = options.seed orelse blk: {
         var anchor: u8 = 0;
         const addr = @intFromPtr(&anchor);
         break :blk @as(u64, @truncate(std.hash.Wyhash.hash(0, std.mem.asBytes(&addr))));
+    };
+    var statistics = Statistics{ .seed = seed };
+    if (@TypeOf(coverage) != @TypeOf(null)) {
+        for (coverage) |*category| category.hits = 0;
+    }
+    defer if (@TypeOf(coverage) != @TypeOf(null)) {
+        if (coverage.len > 0) std.debug.print("Coverage:\n", .{});
+        for (coverage) |*category| {
+            category.percentage = if (statistics.runs == 0) 0 else 100.0 * @as(f64, @floatFromInt(category.hits)) / @as(f64, @floatFromInt(statistics.runs));
+            std.debug.print("  {s}: {d}/{d} ({d:.1}%)\n", .{
+                category.label, category.hits, statistics.runs, category.percentage,
+            });
+        }
+    };
+    defer if (options.statistics) |output| {
+        output.* = statistics;
     };
     var prng = std.Random.DefaultPrng.init(seed);
 
@@ -69,6 +139,12 @@ pub fn check(
         defer if (generator.freeFn) |freeFn| {
             freeFn(allocator, value);
         };
+        statistics.runs += 1;
+        if (@TypeOf(coverage) != @TypeOf(null)) {
+            for (coverage) |*category| {
+                if (category.predicate(value)) category.hits += 1;
+            }
+        }
 
         test_fn(value) catch |err| {
             std.debug.print(
@@ -90,21 +166,19 @@ pub fn check(
                 std.debug.print("Shrinking", .{});
                 var minimal_value = value;
                 var minimal_is_original = true;
-                var shrink_attempts: u32 = 0;
+                // Register value cleanup first so the iterator closes before it is freed.
+                defer if (!minimal_is_original) {
+                    if (generator.freeFn) |freeFn| freeFn(allocator, minimal_value);
+                };
                 var it = shrinker(allocator, minimal_value);
                 defer it.deinit();
 
-                while (it.next()) |next_val| {
-                    shrink_attempts += 1;
-
-                    // Limit shrink attempts
-                    if (shrink_attempts >= options.max_shrink_attempts) {
-                        std.debug.print("\nMax shrink attempts ({d}) reached.\n", .{options.max_shrink_attempts});
-                        break;
-                    }
+                while (statistics.shrink_attempts < options.max_shrink_attempts) {
+                    const next_val = it.next() orelse break;
+                    statistics.shrink_attempts += 1;
 
                     // Progress indicator
-                    if (shrink_attempts % 50 == 0) {
+                    if (statistics.shrink_attempts % 50 == 0) {
                         std.debug.print(".", .{});
                     }
 
@@ -113,6 +187,7 @@ pub fn check(
                             freeFn(allocator, next_val);
                         }
                     } else |_| {
+                        statistics.successful_shrinks += 1;
                         // Order matters: the live iterator may hold a reference
                         // to `minimal_value` via its internal state. Tear down the
                         // iterator before freeing the value it referenced.
@@ -128,16 +203,11 @@ pub fn check(
                     }
                 }
                 std.debug.print("\nMinimal failing input: {any}\n", .{minimal_value});
-                std.debug.print("Shrink attempts: {d}\n", .{shrink_attempts});
-
-                if (!minimal_is_original) {
-                    if (generator.freeFn) |freeFn| {
-                        freeFn(allocator, minimal_value);
-                    }
-                }
+                std.debug.print("Shrink attempts: {d}\n", .{statistics.shrink_attempts});
             }
             return err;
         };
+        statistics.passed += 1;
     }
     std.debug.print("OK. {d} tests passed.\n", .{options.num_runs});
 }
@@ -159,10 +229,13 @@ test "runner: zero runs completes immediately" {
     }.prop;
 
     // With num_runs = 0, the property should never be called
+    var statistics = Statistics{ .runs = 10, .passed = 5, .shrink_attempts = 3, .successful_shrinks = 2 };
     try check(allocator, int_gen, alwaysFail, .{
         .num_runs = 0,
         .seed = 12345,
+        .statistics = &statistics,
     });
+    try testing.expectEqualDeep(Statistics{ .seed = 12345 }, statistics);
 }
 
 test "runner: passing property completes successfully" {
@@ -176,10 +249,15 @@ test "runner: passing property completes successfully" {
         }
     }.prop;
 
+    var statistics: Statistics = .{};
     try check(allocator, int_gen, alwaysPass, .{
         .num_runs = 10,
         .seed = 12345,
+        .statistics = &statistics,
     });
+    try testing.expectEqualDeep(Statistics{ .seed = 12345, .runs = 10, .passed = 10 }, statistics);
+    try check(allocator, int_gen, alwaysPass, .{ .num_runs = 2, .seed = 42, .statistics = &statistics });
+    try testing.expectEqualDeep(Statistics{ .seed = 42, .runs = 2, .passed = 2 }, statistics);
 }
 
 test "runner: failing property returns error" {
@@ -220,12 +298,15 @@ test "runner: generator error propagates" {
         fn prop(_: i32) !void {}
     }.prop;
 
+    var statistics = Statistics{ .runs = 10, .passed = 10 };
     const result = check(allocator, failing_gen, anyProp, .{
         .num_runs = 10,
         .seed = 12345,
+        .statistics = &statistics,
     });
 
     try testing.expectError(core.GenError.InvalidChoice, result);
+    try testing.expectEqualDeep(Statistics{ .seed = 12345 }, statistics);
 }
 
 test "runner: seed produces reproducible results" {
@@ -349,4 +430,243 @@ test "regression: auto seed produces deterministic run with fixed seed" {
     try check(allocator, int_gen, collect2.prop, .{ .num_runs = 10, .seed = 77777 });
 
     try testing.expectEqualSlices(u16, values1.items, values2.items);
+}
+
+test "regression: shrink budget evaluates exactly the allowed candidates without leaks" {
+    const Property = struct {
+        var calls: usize = 0;
+        fn checkValue(s: []const u8) !void {
+            calls += 1;
+            if (s.len == 4) return error.PropertyFailed;
+        }
+    };
+    const Fixed = struct {
+        fn generate(tc: *TestCase) core.GenError![]const u8 {
+            return tc.allocator.dupe(u8, "abcd");
+        }
+        fn free(allocator: Allocator, value: []const u8) void {
+            allocator.free(value);
+        }
+    };
+    const generator = gen.Generator([]const u8){
+        .generateFn = Fixed.generate,
+        .shrinkFn = shrink_mod.stringShrinker(),
+        .freeFn = Fixed.free,
+    };
+    for ([_]u32{ 0, 1, 2, 3 }) |budget| {
+        Property.calls = 0;
+        try testing.expectError(error.PropertyFailed, check(testing.allocator, generator, Property.checkValue, .{
+            .seed = 1,
+            .num_runs = 1,
+            .max_shrink_attempts = budget,
+        }));
+        try testing.expectEqual(@as(usize, budget) + 1, Property.calls);
+    }
+}
+
+test "regression: runner closes borrowing iterators before freeing their values" {
+    const Borrowing = struct {
+        allocator: Allocator,
+        value: []const u8,
+        done: bool = false,
+
+        fn generate(tc: *TestCase) core.GenError![]const u8 {
+            return tc.allocator.dupe(u8, "xxx");
+        }
+        fn shrink(allocator: Allocator, value: []const u8) shrink_mod.Iterator([]const u8) {
+            const context = allocator.create(@This()) catch return shrink_mod.Iterator([]const u8).empty();
+            context.* = .{ .allocator = allocator, .value = value };
+            return .{ .context = context, .nextFn = next, .deinitFn = deinit };
+        }
+        fn next(ctx: *anyopaque) ?[]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (self.done or self.value.len <= 1) return null;
+            self.done = true;
+            return self.allocator.dupe(u8, self.value[0 .. self.value.len - 1]) catch null;
+        }
+        fn deinit(ctx: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            std.debug.assert(self.value[0] == 'x');
+            self.allocator.destroy(self);
+        }
+        fn free(allocator: Allocator, value: []const u8) void {
+            allocator.free(value);
+        }
+        fn property(_: []const u8) !void {
+            return error.PropertyFailed;
+        }
+    };
+    const g = gen.Generator([]const u8){ .generateFn = Borrowing.generate, .shrinkFn = Borrowing.shrink, .freeFn = Borrowing.free };
+    for ([_]u32{ 1, 1000 }) |budget| {
+        try testing.expectError(error.PropertyFailed, check(testing.allocator, g, Borrowing.property, .{
+            .seed = 1,
+            .num_runs = 1,
+            .max_shrink_attempts = budget,
+        }));
+    }
+}
+
+test "runner statistics retain passing runs before a failure" {
+    const Property = struct {
+        var calls: u32 = 0;
+
+        fn prop(_: i32) !void {
+            calls += 1;
+            if (calls == 3) return error.PropertyFailed;
+        }
+    };
+    Property.calls = 0;
+    var generator = gen.int(i32);
+    generator.shrinkFn = null;
+    var statistics: Statistics = .{};
+    try testing.expectError(error.PropertyFailed, check(testing.allocator, generator, Property.prop, .{
+        .num_runs = 10,
+        .seed = 42,
+        .statistics = &statistics,
+    }));
+    try testing.expectEqualDeep(Statistics{ .seed = 42, .runs = 3, .passed = 2 }, statistics);
+}
+
+test "runner statistics distinguish shrink attempts from accepted candidates" {
+    const Property = struct {
+        var calls: u32 = 0;
+        var failures: u32 = 0;
+        fn checkValue(value: i32) !void {
+            calls += 1;
+            if (value > 8) {
+                failures += 1;
+                return error.PropertyFailed;
+            }
+        }
+    };
+    const generator = gen.Generator(i32){
+        .generateFn = gen.constant(@as(i32, 100)).generateFn,
+        .shrinkFn = gen.int(i32).shrinkFn,
+        .freeFn = null,
+    };
+    for ([_]u32{ 0, 1, 3, 1000 }) |budget| {
+        Property.calls = 0;
+        Property.failures = 0;
+        var statistics: Statistics = .{};
+        try testing.expectError(error.PropertyFailed, check(testing.allocator, generator, Property.checkValue, .{
+            .seed = 42,
+            .num_runs = 10,
+            .max_shrink_attempts = budget,
+            .statistics = &statistics,
+        }));
+        try testing.expectEqualDeep(Statistics{
+            .seed = 42,
+            .runs = 1,
+            .passed = 0,
+            .shrink_attempts = Property.calls - 1,
+            .successful_shrinks = Property.failures - 1,
+        }, statistics);
+        try testing.expect(statistics.shrink_attempts <= budget);
+        if (budget == 1000) {
+            try testing.expect(statistics.successful_shrinks > 0);
+            try testing.expect(statistics.successful_shrinks < statistics.shrink_attempts);
+        }
+    }
+}
+
+test "coverage counts overlapping categories and resets on success and errors" {
+    const Fixture = struct {
+        var generated: u32 = 0;
+        var generator_error_at: ?u32 = null;
+        var property_error_at: ?i32 = null;
+        var classified: u32 = 0;
+
+        fn generate(_: *TestCase) core.GenError!i32 {
+            if (generator_error_at) |limit| {
+                if (generated == limit) return error.InvalidChoice;
+            }
+            const value: i32 = @intCast(generated);
+            generated += 1;
+            return value;
+        }
+        fn property(value: i32) !void {
+            if (property_error_at) |limit| {
+                if (value >= limit) return error.PropertyFailed;
+            }
+        }
+        fn all(_: i32) bool {
+            classified += 1;
+            return true;
+        }
+        fn even(value: i32) bool {
+            return @mod(value, 2) == 0;
+        }
+        fn never(_: i32) bool {
+            return false;
+        }
+    };
+    const generator = gen.Generator(i32){
+        .generateFn = Fixture.generate,
+        .shrinkFn = gen.int(i32).shrinkFn,
+        .freeFn = null,
+    };
+    var coverage = [_]Coverage(i32){
+        .{ .label = "all", .predicate = Fixture.all, .hits = 99, .percentage = 99 },
+        .{ .label = "even", .predicate = Fixture.even },
+        .{ .label = "never", .predicate = Fixture.never },
+    };
+    const Scenario = struct {
+        num_runs: u32 = 5,
+        generator_error_at: ?u32 = null,
+        property_error_at: ?i32 = null,
+        expected_error: ?anyerror = null,
+        expected_runs: u32,
+        expected_even: u32,
+    };
+    for ([_]Scenario{
+        .{ .expected_runs = 5, .expected_even = 3 },
+        .{ .property_error_at = 2, .expected_error = error.PropertyFailed, .expected_runs = 3, .expected_even = 2 },
+        .{ .generator_error_at = 3, .expected_error = error.InvalidChoice, .expected_runs = 3, .expected_even = 2 },
+        .{ .generator_error_at = 0, .expected_error = error.InvalidChoice, .expected_runs = 0, .expected_even = 0 },
+        .{ .num_runs = 0, .expected_runs = 0, .expected_even = 0 },
+    }) |scenario| {
+        Fixture.generated = 0;
+        Fixture.classified = 0;
+        Fixture.generator_error_at = scenario.generator_error_at;
+        Fixture.property_error_at = scenario.property_error_at;
+        var statistics: Statistics = .{};
+        const result = checkWithCoverage(testing.allocator, generator, Fixture.property, coverage[0..], .{
+            .num_runs = scenario.num_runs,
+            .seed = 42,
+            .statistics = &statistics,
+        });
+        if (scenario.expected_error) |err| {
+            try testing.expectError(err, result);
+        } else {
+            try result;
+        }
+        try testing.expectEqual(scenario.expected_runs, statistics.runs);
+        try testing.expectEqual(scenario.expected_runs, Fixture.classified);
+        try testing.expectEqual(scenario.expected_runs, coverage[0].hits);
+        try testing.expectEqual(scenario.expected_even, coverage[1].hits);
+        try testing.expectEqual(@as(u32, 0), coverage[2].hits);
+        try testing.expectEqual(@as(f64, if (scenario.expected_runs == 0) 0 else 100), coverage[0].percentage);
+        const expected_percentage: f64 = if (scenario.expected_runs == 0) 0 else 100.0 * @as(f64, @floatFromInt(scenario.expected_even)) / @as(f64, @floatFromInt(scenario.expected_runs));
+        try testing.expectApproxEqAbs(expected_percentage, coverage[1].percentage, 0.000001);
+        try testing.expectEqual(@as(f64, 0), coverage[2].percentage);
+        if (scenario.property_error_at != null) try testing.expect(statistics.shrink_attempts > 0);
+    }
+}
+
+test "coverage borrows owned inputs and accepts an empty category list" {
+    const Fixture = struct {
+        fn lengthThree(value: []const u8) bool {
+            return value.len == 3;
+        }
+        fn property(value: []const u8) !void {
+            try testing.expectEqual(@as(usize, 3), value.len);
+        }
+    };
+    const generator = gen.string(.{ .min_len = 3, .max_len = 3 });
+    var coverage = [_]Coverage([]const u8){.{ .label = "length three", .predicate = Fixture.lengthThree }};
+    try checkWithCoverage(testing.allocator, generator, Fixture.property, &coverage, .{ .seed = 42, .num_runs = 5 });
+    try testing.expectEqual(@as(u32, 5), coverage[0].hits);
+    try testing.expectEqual(@as(f64, 100), coverage[0].percentage);
+    var empty: [0]Coverage([]const u8) = .{};
+    try checkWithCoverage(testing.allocator, generator, Fixture.property, &empty, .{ .seed = 42, .num_runs = 5 });
 }

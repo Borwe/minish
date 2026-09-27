@@ -45,11 +45,12 @@ This document outlines the features implemented in Minish and the future goals f
 - [x] Integer shrinking (towards zero)
 - [x] Float shrinking (towards zero)
 - [x] List and string shrinking (multiphase removal)
-- [x] Tuple shrinking (element-wise)
-- [x] Array shrinking (element-wise)
-- [x] Optional shrinking (try null first)
-- [ ] Struct shrinking (field-wise)
-- [ ] Element-wise list shrinking (shrink elements in place)
+- [x] Automatic tuple shrinking (`tuple2` and `tuple3`, with owned elements)
+- [x] Automatic array shrinking (element-wise, with owned elements)
+- [x] Automatic optional shrinking (try null first, then shrink the contained value)
+- [x] Struct shrinking (field-wise)
+- [x] Element-wise list shrinking
+- [x] Ownership-safe list shrinking for elements with a `freeFn` and a `cloneFn`
 
 ### Test Runner
 
@@ -58,8 +59,8 @@ This document outlines the features implemented in Minish and the future goals f
 - [x] Max shrink attempts limit
 - [x] Verbose mode
 - [x] Improved failure messages with seed output
-- [ ] Statistics collection
-- [ ] Coverage reporting
+- [x] Statistics collection
+- [x] Coverage reporting for named input categories
 
 ### Documentation
 
@@ -68,13 +69,12 @@ This document outlines the features implemented in Minish and the future goals f
 - [x] Module-level docstrings (lib, gen, shrink, combinators, runner, core)
 - [x] Function-level docstrings for public API
 - [x] Generated API docs via `zig build docs`
-- [ ] Tutorial guide
 
 ### Future Goals
 
 - [ ] Stateful testing (using state machine or model-based)
 - [ ] Command sequence generation
 - [ ] Test database for reproducibility
-- [ ] Integration with Zig's test framework
+- [x] Integration with Zig's test framework
 - [ ] Parallel test execution
 - [ ] Custom shrinker DSL
