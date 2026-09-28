@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub fn build(b: *std.Build) void {
+pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
@@ -35,7 +35,19 @@ pub fn build(b: *std.Build) void {
     // intermediate parents, and git does not track empty directories, so a
     // fresh checkout may have no `docs/` at all. Create it portably here
     // (idempotent: makePath is a no-op when the directory already exists).
-    const ensure_docs_dir = EnsureDirStep.create(b, "docs");
+    const make_docs_exe = b.addExecutable(.{
+        .name="make_docs_dir",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/make_docs.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const make_docs_art = b.addRunArtifact(make_docs_exe);
+    const root_dir =try b.root.toString(b.graph.arena);
+    defer b.graph.arena.free(root_dir);
+    make_docs_art.addArg(root_dir);
+
     const gen_docs_cmd = b.addSystemCommand(&[_][]const u8{
         b.graph.zig_exe,
         "build-lib",
@@ -43,11 +55,11 @@ pub fn build(b: *std.Build) void {
         "-femit-docs=" ++ doc_path,
         "-fno-emit-bin",
     });
-    gen_docs_cmd.step.dependOn(&ensure_docs_dir.step);
+    gen_docs_cmd.step.dependOn(&make_docs_art.step);
     docs_step.dependOn(&gen_docs_cmd.step);
 
     // Examples (only when developing minish itself, not when used as a dependency)
-    if (b.build_root.handle.openDir(io, "examples", .{ .iterate = true })) |examples_dir| {
+    if (b.root.openDir(io, "examples", .{ .iterate = true })) |examples_dir| {
         var dir = examples_dir;
         defer dir.close(io);
         const run_all_step = b.step("run-all", "Run all examples");
@@ -95,31 +107,3 @@ pub fn build(b: *std.Build) void {
     }
 }
 
-/// Build step that ensures a directory (relative to the build root) exists.
-/// Runs `std.fs.Dir.makePath` at make-time, so it only fires when a step
-/// that depends on it is actually being built. Portable across Linux,
-/// macOS, and Windows.
-const EnsureDirStep = struct {
-    step: std.Build.Step,
-    sub_path: []const u8,
-
-    fn create(b: *std.Build, sub_path: []const u8) *EnsureDirStep {
-        const self = b.allocator.create(EnsureDirStep) catch @panic("OOM");
-        self.* = .{
-            .step = std.Build.Step.init(.{
-                .id = .custom,
-                .name = b.fmt("ensure {s}/", .{sub_path}),
-                .owner = b,
-                .makeFn = make,
-            }),
-            .sub_path = sub_path,
-        };
-        return self;
-    }
-
-    fn make(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anyerror!void {
-        _ = options;
-        const self: *EnsureDirStep = @fieldParentPtr("step", step);
-        try step.owner.build_root.handle.createDirPath(step.owner.graph.io, self.sub_path);
-    }
-};
