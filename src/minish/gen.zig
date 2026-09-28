@@ -60,7 +60,7 @@ fn generate_int(comptime T: type) fn (tc: *TestCase) core.GenError!T {
             } else {
                 // For signed integers, generate across unsigned range and bitcast
                 // This correctly covers the full range including minInt
-                const UnsignedT = std.meta.Int(.unsigned, IntType.bits);
+                const UnsignedT = @Int(.unsigned, IntType.bits);
                 const max_unsigned = std.math.maxInt(UnsignedT);
                 const val = try tc.choice(max_unsigned);
                 return @bitCast(@as(UnsignedT, @intCast(val)));
@@ -213,7 +213,7 @@ pub fn enumValue(comptime E: type) Generator(E) {
             if (enum_info != .@"enum") {
                 @compileError("enumValue() requires an enum type");
             }
-            const fields = enum_info.@"enum".fields;
+            const fields = enum_info.@"enum".field_values;
             if (fields.len == 0) {
                 return error.InvalidChoice;
             }
@@ -223,7 +223,7 @@ pub fn enumValue(comptime E: type) Generator(E) {
             const all_values = blk: {
                 var vals: [fields.len]E = undefined;
                 inline for (fields, 0..) |f, i| {
-                    vals[i] = @enumFromInt(f.value);
+                    vals[i] = @fromBackingInt(f);
                 }
                 break :blk vals;
             };
@@ -707,15 +707,15 @@ pub fn structure(
         @compileError("structure() requires a struct type");
     }
     const can_clone = comptime blk: {
-        for (type_info.@"struct".fields) |field| {
-            const field_gen = @field(field_gens, field.name);
+        for (type_info.@"struct".field_names) |name| {
+            const field_gen = @field(field_gens, name);
             if (field_gen.freeFn != null and field_gen.cloneFn == null) break :blk false;
         }
         break :blk true;
     };
     const has_shrinker = comptime blk: {
-        for (type_info.@"struct".fields) |field| {
-            if (@field(field_gens, field.name).shrinkFn != null) break :blk true;
+        for (type_info.@"struct".field_names) |name| {
+            if (@field(field_gens, name).shrinkFn != null) break :blk true;
         }
         break :blk false;
     };
@@ -728,19 +728,19 @@ pub fn structure(
             // free them on partial failure.
             var filled_idx: usize = 0;
             errdefer {
-                inline for (struct_info.fields, 0..) |field, i| {
+                inline for (struct_info.field_names, 0..) |name, i| {
                     if (i < filled_idx) {
-                        const field_gen = @field(field_gens, field.name);
+                        const field_gen = @field(field_gens, name);
                         if (field_gen.freeFn) |freeFn| {
-                            freeFn(tc.allocator, @field(result, field.name));
+                            freeFn(tc.allocator, @field(result, name));
                         }
                     }
                 }
             }
 
-            inline for (struct_info.fields) |field| {
-                const field_gen = @field(field_gens, field.name);
-                @field(result, field.name) = try field_gen.generateFn(tc);
+            inline for (struct_info.field_names) |name| {
+                const field_gen = @field(field_gens, name);
+                @field(result, name) = try field_gen.generateFn(tc);
                 filled_idx += 1;
             }
 
@@ -749,10 +749,10 @@ pub fn structure(
 
         fn free(allocator: std.mem.Allocator, value: T) void {
             const struct_info = @typeInfo(T).@"struct";
-            inline for (struct_info.fields) |field| {
-                const field_gen = @field(field_gens, field.name);
+            inline for (struct_info.field_names) |name| {
+                const field_gen = @field(field_gens, name);
                 if (field_gen.freeFn) |freeFn| {
-                    freeFn(allocator, @field(value, field.name));
+                    freeFn(allocator, @field(value, name));
                 }
             }
         }
@@ -1691,7 +1691,7 @@ test "owned array and tuple candidates change one element without aliasing" {
         g.freeFn.?(testing.allocator, copy);
         var it = g.shrinkFn.?(testing.allocator, original);
         defer it.deinit();
-        var saw_element = [_]bool{false} ** size;
+        var saw_element = [_]bool{false}**size;
         while (it.next()) |candidate| {
             defer g.freeFn.?(testing.allocator, candidate);
             var changed: usize = 0;
